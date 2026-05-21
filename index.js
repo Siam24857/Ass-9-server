@@ -2,7 +2,7 @@ const express = require("express");
 const dotenv = require("dotenv");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-const { createRemoteJWKSet, jwtVerify } = require("jose-cjs");
+const { createRemoteJWKSet, jwtVerify } = require("jose");
 
 dotenv.config();
 
@@ -10,141 +10,326 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 const uri = process.env.MONGO_URL;
+const JWKS_URI = process.env.JWKS_URI; // Fixed: Changed from CLIENT_URL
 
 if (!uri) {
-  throw new Error("❌ MONGO_URL is missing in .env");
+  console.error("❌ MONGO_URL is missing in .env");
+  // Don't throw error in production, just log
 }
 
+if (!JWKS_URI) {
+  console.warn("⚠️ JWKS_URI is missing - Auth will be disabled");
+}
+
+// Middleware
 app.use(cors());
 app.use(express.json());
 
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
+// Global cache for serverless connections
+let cachedClient = null;
+let cachedDb = null;
 
-// FIXED: safe env variable
-const JWKS_URL = process.env.CLIENT_URL;
+// Database connection function with caching
+async function connectToDatabase() {
+  if (!uri) {
+    throw new Error("MONGO_URL is not configured");
+  }
 
-if (!JWKS_URL) {
-  console.warn("⚠️ CLIENT_URL is missing");
+  // Check if we have a valid connection
+  if (cachedClient && cachedClient.topology && cachedClient.topology.isConnected()) {
+    console.log("✅ Using cached database connection");
+    return { client: cachedClient, db: cachedDb };
+  }
+
+  // Create new connection
+  console.log("🔄 Creating new database connection");
+  cachedClient = new MongoClient(uri, {
+    serverApi: {
+      version: ServerApiVersion.v1,
+      strict: true,
+      deprecationErrors: true,
+    },
+    maxPoolSize: 1, // Important for serverless
+    minPoolSize: 0,
+    connectTimeoutMS: 10000,
+    socketTimeoutMS: 45000,
+  });
+
+  await cachedClient.connect();
+  cachedDb = cachedClient.db("Studing-room");
+  
+  console.log("✅ New database connection established");
+  return { client: cachedClient, db: cachedDb };
 }
 
-const JWKS = JWKS_URL
-  ? createRemoteJWKSet(new URL(`${JWKS_URL}/api/auth/jwks`))
-  : null;
+// JWKS Setup
+const JWKS = JWKS_URI ? createRemoteJWKSet(new URL(JWKS_URI)) : null;
 
+// Authentication Middleware
 const VerifiedToken = async (req, res, next) => {
   try {
+    // If JWKS not configured, skip auth (development only)
+    if (!JWKS) {
+      console.warn("⚠️ Auth disabled - JWKS not configured");
+      return next();
+    }
+
     const authHeader = req.headers.authorization;
 
     if (!authHeader) {
-      return res.status(401).send("Unauthorized Access");
+      return res.status(401).json({ error: "Unauthorized Access - No token provided" });
     }
 
     const token = authHeader.split(" ")[1];
 
     if (!token) {
-      return res.status(401).send("Unauthorized Access");
-    }
-
-    if (!JWKS) {
-      return res.status(500).send("JWKS not configured");
+      return res.status(401).json({ error: "Unauthorized Access - Invalid token format" });
     }
 
     const { payload } = await jwtVerify(token, JWKS);
-
     req.user = payload;
     next();
   } catch (err) {
-    return res.status(401).send("Unauthorized Access");
+    console.error("Auth error:", err.message);
+    return res.status(401).json({ error: "Unauthorized Access - Invalid token" });
   }
 };
 
-async function run() {
+// ============= ROUTES =============
+
+// Test route
+app.get("/", (req, res) => {
+  res.json({ 
+    message: "Studying Room API is running!", 
+    status: "healthy",
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Health check route
+app.get("/health", async (req, res) => {
   try {
-    await client.connect();
-
-    const myDB = client.db("Studing-room");
-    const roomcollection = myDB.collection("rooms");
-    const listedrooms = myDB.collection("listedrooms");
-    const bookinsroom = myDB.collection("bookionsroom");
-
-    app.get("/home", async (req, res) => {
-      const result = await roomcollection.find().limit(8).toArray();
-      res.send(result);
+    const { db } = await connectToDatabase();
+    await db.command({ ping: 1 });
+    res.json({ 
+      status: "healthy", 
+      database: "connected",
+      auth: JWKS ? "enabled" : "disabled"
     });
-
-    app.get("/rooms", async (req, res) => {
-      const result = await roomcollection.find().toArray();
-      res.send(result);
+  } catch (error) {
+    res.status(500).json({ 
+      status: "unhealthy", 
+      database: "disconnected",
+      error: error.message 
     });
-
-    app.get("/rooms/:id", async (req, res) => {
-      const { id } = req.params;
-
-      const result = await roomcollection
-        .find({
-          amenities: { $in: [id] },
-        })
-        .toArray();
-
-      res.send(result);
-    });
-
-    app.post("/add-rooms", async (req, res) => {
-      const result = await roomcollection.insertOne(req.body);
-      res.send(result);
-    });
-
-    app.get("/listed-room", async (req, res) => {
-      const result = await listedrooms.find().toArray();
-      res.send(result);
-    });
-
-    app.post("/listed-room-add", async (req, res) => {
-      const result = await listedrooms.insertOne(req.body);
-      res.send(result);
-    });
-
-    app.get("/roomdetails/:id", async (req, res) => {
-      const result = await roomcollection.findOne({
-        _id: new ObjectId(req.params.id),
-      });
-
-      res.send(result);
-    });
-
-    app.delete("/listed/:id", async (req, res) => {
-      const result = await listedrooms.deleteOne({
-        _id: new ObjectId(req.params.id),
-      });
-
-      res.send(result);
-    });
-
-    app.post("/bookings", async (req, res) => {
-      const result = await bookinsroom.insertOne(req.body);
-      res.send(result);
-    });
-
-    app.get("/bookings", async (req, res) => {
-      const result = await bookinsroom.find().toArray();
-      res.send(result);
-    });
-
-   
-    console.log("✅ MongoDB Connected Successfully!");
-  } catch (err) {
-    console.error("❌ Server Crash:", err);
   }
+});
+
+// Get home rooms (limited to 8)
+app.get("/home", async (req, res) => {
+  try {
+    const { db } = await connectToDatabase();
+    const roomcollection = db.collection("rooms");
+    const result = await roomcollection.find().limit(8).toArray();
+    res.json(result);
+  } catch (error) {
+    console.error("Error in /home:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get all rooms
+app.get("/rooms", async (req, res) => {
+  try {
+    const { db } = await connectToDatabase();
+    const roomcollection = db.collection("rooms");
+    const result = await roomcollection.find().toArray();
+    res.json(result);
+  } catch (error) {
+    console.error("Error in /rooms:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get rooms by amenity
+app.get("/rooms/amenity/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { db } = await connectToDatabase();
+    const roomcollection = db.collection("rooms");
+    const result = await roomcollection
+      .find({
+        amenities: { $in: [id] },
+      })
+      .toArray();
+    res.json(result);
+  } catch (error) {
+    console.error("Error in /rooms/amenity:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Add new room (protected)
+app.post("/add-rooms", VerifiedToken, async (req, res) => {
+  try {
+    const { db } = await connectToDatabase();
+    const roomcollection = db.collection("rooms");
+    const result = await roomcollection.insertOne(req.body);
+    res.json({ success: true, id: result.insertedId });
+  } catch (error) {
+    console.error("Error in /add-rooms:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get all listed rooms
+app.get("/listed-room", async (req, res) => {
+  try {
+    const { db } = await connectToDatabase();
+    const listedrooms = db.collection("listedrooms");
+    const result = await listedrooms.find().toArray();
+    res.json(result);
+  } catch (error) {
+    console.error("Error in /listed-room:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Add to listed rooms
+app.post("/listed-room-add", VerifiedToken, async (req, res) => {
+  try {
+    const { db } = await connectToDatabase();
+    const listedrooms = db.collection("listedrooms");
+    const result = await listedrooms.insertOne(req.body);
+    res.json({ success: true, id: result.insertedId });
+  } catch (error) {
+    console.error("Error in /listed-room-add:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get room details by ID
+app.get("/roomdetails/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid room ID format" });
+    }
+
+    const { db } = await connectToDatabase();
+    const roomcollection = db.collection("rooms");
+    const result = await roomcollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!result) {
+      return res.status(404).json({ error: "Room not found" });
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error("Error in /roomdetails:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Delete listed room
+app.delete("/listed/:id", VerifiedToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid ID format" });
+    }
+
+    const { db } = await connectToDatabase();
+    const listedrooms = db.collection("listedrooms");
+    const result = await listedrooms.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: "Room not found in listed" });
+    }
+
+    res.json({ success: true, deleted: true });
+  } catch (error) {
+    console.error("Error in /listed/:id:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Create booking
+app.post("/bookings", VerifiedToken, async (req, res) => {
+  try {
+    const { db } = await connectToDatabase();
+    const bookingsroom = db.collection("bookionsroom");
+    
+    // Add timestamp to booking
+    const bookingData = {
+      ...req.body,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+    
+    const result = await bookingsroom.insertOne(bookingData);
+    res.json({ success: true, bookingId: result.insertedId });
+  } catch (error) {
+    console.error("Error in /bookings (POST):", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get all bookings
+app.get("/bookings", VerifiedToken, async (req, res) => {
+  try {
+    const { db } = await connectToDatabase();
+    const bookingsroom = db.collection("bookionsroom");
+    const result = await bookingsroom.find().toArray();
+    res.json(result);
+  } catch (error) {
+    console.error("Error in /bookings (GET):", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get bookings by user email
+app.get("/bookings/user/:email", VerifiedToken, async (req, res) => {
+  try {
+    const { email } = req.params;
+    const { db } = await connectToDatabase();
+    const bookingsroom = db.collection("bookionsroom");
+    const result = await bookingsroom.find({ userEmail: email }).toArray();
+    res.json(result);
+  } catch (error) {
+    console.error("Error in /bookings/user:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: "Route not found" });
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error("Global error:", err);
+  res.status(500).json({ error: "Something went wrong!" });
+});
+
+// ============= SERVER START =============
+
+// For local development
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(port, () => {
+    console.log(`🚀 Server running on http://localhost:${port}`);
+    console.log(`📡 Environment: ${process.env.NODE_ENV || 'development'}`);
+    // Initialize database connection
+    connectToDatabase().catch(console.error);
+  });
 }
 
-run();
-
-app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
-});
+// Export for Vercel serverless deployment
+module.exports = app;
