@@ -9,20 +9,30 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 5000;
 
-const uri = process.env.MONGO_URL;
-const JWKS_URI = process.env.JWKS_URI; // Fixed: Changed from CLIENT_URL
+const uri = process.env.MONGO_URL?.replace(/["';]+$/, "");
+const JWKS_URI = process.env.JWKS_URI;
+const clientUrl = process.env.CLIENT_URL || process.env.CLINT_URL;
+
+const isVercel = Boolean(process.env.VERCEL);
+const isProduction = process.env.NODE_ENV === "production" || isVercel;
 
 if (!uri) {
-  console.error(" MONGO_URL is missing in .env");
-  // Don't throw error in production, just log
+  console.error("MONGO_URL is missing");
 }
 
-if (!JWKS_URI) {
-  console.warn("JWKS_URI is missing - Auth will be disabled");
+if (!JWKS_URI && isProduction) {
+  console.warn("JWKS_URI is missing - protected routes will reject requests in production");
+} else if (!JWKS_URI) {
+  console.warn("JWKS_URI is missing - Auth will be disabled in development");
 }
 
 // Middleware
-app.use(cors());
+app.use(
+  cors({
+    origin: clientUrl ? [clientUrl] : true,
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 // Global cache for serverless connections
@@ -66,9 +76,11 @@ const JWKS = JWKS_URI ? createRemoteJWKSet(new URL(JWKS_URI)) : null;
 // Authentication Middleware
 const VerifiedToken = async (req, res, next) => {
   try {
-    // If JWKS not configured, skip auth (development only)
     if (!JWKS) {
-      console.warn("⚠️ Auth disabled - JWKS not configured");
+      if (isProduction) {
+        return res.status(503).json({ error: "Auth is not configured on the server" });
+      }
+      console.warn("Auth disabled - JWKS not configured");
       return next();
     }
 
@@ -345,15 +357,13 @@ app.use((err, req, res, next) => {
 
 // ============= SERVER START =============
 
-// For local development
-if (process.env.NODE_ENV !== 'production') {
+// Local development only (Vercel runs the exported app as a serverless function)
+if (!isVercel && !isProduction) {
   app.listen(port, () => {
-    console.log(`🚀 Server running on http://localhost:${port}`);
-    console.log(`📡 Environment: ${process.env.NODE_ENV || 'development'}`);
-    // Initialize database connection
+    console.log(`Server running on http://localhost:${port}`);
+    console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
     connectToDatabase().catch(console.error);
   });
 }
 
-// Export for Vercel serverless deployment
 module.exports = app;
