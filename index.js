@@ -2,7 +2,7 @@ const express = require("express");
 const dotenv = require("dotenv");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-const { createRemoteJWKSet, jwtVerify } = require("jose");
+const { createRemoteJWKSet, jwtVerify } = require("jose-cjs");
 
 dotenv.config();
 
@@ -13,12 +13,12 @@ const uri = process.env.MONGO_URL;
 const JWKS_URI = process.env.JWKS_URI; // Fixed: Changed from CLIENT_URL
 
 if (!uri) {
-  console.error("❌ MONGO_URL is missing in .env");
+  console.error(" MONGO_URL is missing in .env");
   // Don't throw error in production, just log
 }
 
 if (!JWKS_URI) {
-  console.warn("⚠️ JWKS_URI is missing - Auth will be disabled");
+  console.warn("JWKS_URI is missing - Auth will be disabled");
 }
 
 // Middleware
@@ -35,9 +35,7 @@ async function connectToDatabase() {
     throw new Error("MONGO_URL is not configured");
   }
 
-  // Check if we have a valid connection
-  if (cachedClient && cachedClient.topology && cachedClient.topology.isConnected()) {
-    console.log("✅ Using cached database connection");
+  if (cachedClient && cachedDb) {
     return { client: cachedClient, db: cachedDb };
   }
 
@@ -80,7 +78,9 @@ const VerifiedToken = async (req, res, next) => {
       return res.status(401).json({ error: "Unauthorized Access - No token provided" });
     }
 
-    const token = authHeader.split(" ")[1];
+    const token = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7).trim()
+      : authHeader.split(" ")[1];
 
     if (!token) {
       return res.status(401).json({ error: "Unauthorized Access - Invalid token format" });
@@ -260,6 +260,30 @@ app.delete("/listed/:id", VerifiedToken, async (req, res) => {
   }
 });
 
+app.patch("/listed/:id", VerifiedToken, async (req, res) => {
+    const {id} = req.params
+    const listeeddata = req.body
+      const { db } = await connectToDatabase();
+    const listedrooms = db.collection("listedrooms");
+    const result = await listedrooms.updateOne(
+      {_id: new ObjectId(id),},
+      {$set: listeeddata}
+    );
+    res.send(result)
+});
+
+app.patch("/rooms/:id", VerifiedToken, async (req, res) => {
+    const {roomid} = req.params
+    const listeeddata = req.body
+     const { db } = await connectToDatabase();
+    const roomcollection = db.collection("rooms");
+    const result = await roomcollection.updateOne(
+      {roomID: roomid ,},
+      {$set: listeeddata}
+    );
+    res.send(result)
+});
+
 // Create booking
 app.post("/bookings", VerifiedToken, async (req, res) => {
   try {
@@ -297,7 +321,7 @@ app.get("/bookings", VerifiedToken, async (req, res) => {
 // Get bookings by user email
 app.get("/bookings/user/:email", VerifiedToken, async (req, res) => {
   try {
-    const { email } = req.params;
+    const email = decodeURIComponent(req.params.email);
     const { db } = await connectToDatabase();
     const bookingsroom = db.collection("bookionsroom");
     const result = await bookingsroom.find({ userEmail: email }).toArray();
